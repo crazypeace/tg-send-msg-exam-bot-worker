@@ -338,7 +338,9 @@ async function handleGroupMessage(env, update) {
     parse_mode: "HTML",
     disable_web_page_preview: true,
   });
-
+  // 还有一个方案是设置 telegram group welcome message, 这样不会对其它群友造成影响
+  // https://zelikk.blogspot.com/2026/09/telegram-group-welcome-message.html
+  
   log(`muted+stored user=${user.id} chat=${chat.id} msg=${msg.message_id}`);
 }
 
