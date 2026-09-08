@@ -14,6 +14,9 @@
  *      VALID[user_id]   = 任意值 (空串/乱码/JSON 均可), key 存在即有效 = 已验证白名单
  *  - 未验证用户 (ID>=8B 且不在白名单) 在群里发消息:
  *      禁言 -> 转发到仓库频道 -> 删原消息 -> 记 pending -> 群内警告 (不自动删)
+ *  - 判定只看 ID 阈值 + 自家 VALID 白名单, 不看 Telegram 服务端权限状态:
+ *    被 join-group 验证放行 (restricted+can_send=true)、或管理员解除限制 (status=member) 的用户,
+ *    只要不在白名单, 发言即再次禁言 (与 tg-join-group-exam 不同: 那边"能发言=已验证", 这边"能发言≠已验证")
  *  - 私聊 /start: 仅待验证用户出题; 已验证 -> "已通过验证"; 其余 -> 简介
  *  - 私聊答题: 归一化子串匹配 (对齐 VPS correct in user_answer);
  *      通过 -> 解除禁言 + 写 VALID + 恢复暂存消息 + 群内通知
@@ -33,14 +36,14 @@ const TG_API = "https://api.telegram.org/bot";
 const LEGACY_USER_ID_MAX = 8000000000; // ID < 8B = 早期用户, 免验证 (VPS 版阈值, 不是 2B)
 const PENDING_TTL_SECONDS = 86400; // 24h
 
-const Q_TYPES = ["blog", "rss", "youtube"];
+const Q_TYPES = ["rss", "youtube", "blog"];
 
 const BLOG_ANSWER = "zelikk.blogspot.com";
 const YOUTUBE_ANSWER = "youtube.com/@crazypeace";
 
 const QUESTION_TEXT = {
-  rss: "❓ 请问：我的博客的最新一期博文标题是什么？",
   blog: "❓ 请问：我的博客地址是什么？",
+  rss: "❓ 请问：我的博客的最新一期博文标题是什么？",
   youtube: "❓ 请问：我的Youtube频道url是什么？",
 };
 
@@ -51,8 +54,19 @@ const INTRO_TEXT =
   "🔹 未验证用户需要向我发送 /start 并回答验证问题\n" +
   "🔹 验证通过后，我会自动解除禁言";
 
-// 与 VPS 版 ChatPermissions 逐字段一致
-const MUTE_PERMISSIONS = { can_send_messages: false };
+// 与 VPS 版 ChatPermissions 逐字段一致; 
+const MUTE_PERMISSIONS = {
+  can_send_messages: false,
+  // can_send_audios: false,
+  // can_send_documents: false,
+  // can_send_photos: false,
+  // can_send_videos: false,
+  // can_send_video_notes: false,
+  // can_send_voice_notes: false,
+  // can_send_polls: false,
+  // can_send_other_messages: false,
+  // can_add_web_page_previews: false,
+};
 
 const DEFAULT_PERMISSIONS = {
   can_send_messages: true,
@@ -62,9 +76,9 @@ const DEFAULT_PERMISSIONS = {
   can_send_audios: true,
   can_send_voice_notes: true,
   can_send_documents: true,
-  can_send_other_messages: false,
+  can_send_other_messages: true,
   can_add_web_page_previews: true,
-  can_send_polls: false,
+  can_send_polls: true,
 };
 
 // ---------------------------------------------------------------- 基础设施
@@ -232,7 +246,7 @@ async function verifySuccess(env, userId, user) {
     chat_id: env.CHAT_ID,
     user_id: userId,
     permissions: DEFAULT_PERMISSIONS,
-    use_independent_permissions: true,
+    use_independent_chat_permissions: true,
   });
 
   await env.VALID.put(String(userId), JSON.stringify(userMeta(user)));
@@ -290,7 +304,7 @@ async function handleGroupMessage(env, update) {
     chat_id: chat.id,
     user_id: user.id,
     permissions: MUTE_PERMISSIONS,
-    use_independent_permissions: true,
+    use_independent_chat_permissions: true,
   });
 
   // 2. 转发原消息到仓库频道
@@ -327,7 +341,7 @@ async function handleGroupMessage(env, update) {
     expirationTtl: PENDING_TTL_SECONDS,
   });
 
-  // 5. 群内警告 (不自动删)
+  5. 群内警告 (不自动删)
   const username = await botUsername(env);
   await api(env, "sendMessage", {
     chat_id: chat.id,
@@ -590,4 +604,4 @@ export default {
 };
 
 // 导出纯函数仅供本地测试 (test.js); Worker 部署不受影响
-export { dispatch, questionType, normalize, checkAnswer, parseRssTitle, isValidUser };
+export { dispatch, questionType, normalize, checkAnswer, parseRssTitle, isValidUser, MUTE_PERMISSIONS };
