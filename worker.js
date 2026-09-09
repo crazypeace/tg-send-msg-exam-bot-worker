@@ -341,7 +341,7 @@ async function handleGroupMessage(env, update) {
     expirationTtl: PENDING_TTL_SECONDS,
   });
 
-  5. 群内警告 (不自动删)
+  // 5. 群内警告 (不自动删)
   const username = await botUsername(env);
   await api(env, "sendMessage", {
     chat_id: chat.id,
