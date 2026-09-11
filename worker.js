@@ -8,21 +8,18 @@
  *      blog    题面"我的博客地址是什么?"         固定答案 zelikk.blogspot.com
  *      rss     题面"我的博客的最新一期博文标题是什么?"  动态, 判分时实时抓 RSS 首个标题
  *      youtube 题面"我的Youtube频道url是什么?"   固定答案 youtube.com/@crazypeace
- *  - pending 状态在 KV; 已验证标记 = 用户 tag, 不再存 KV:
- *      PENDING[user_id] = {join_time, stored_messages:[{message_id, original_chat_id}]}  TTL 24h
- *                        记录存在即视为"待验证" (对齐 VPS 版 pending_users 语义)
- *      已验证 = getChatMember 返回的 tag 非空; tag 由本 bot 打/清, 值恒为 FQer (setChatMemberTag)
- *  - PENDING KV 未绑定 / STORAGE_CHANNEL_ID 未配置 = 无状态模式 (不异常):
- *      失去: 消息暂存/恢复、join_time 计时; "待验证"判定退化为"被禁言 (restricted+不能发文字)"
- *      禁言/警告/出题/判分/放行/打 tag 全部照常
- *  - 未验证用户 (ID>=8B 且 tag 为空) 在群里发消息:
- *      禁言 -> 转发到仓库频道 -> 删原消息 -> 记 pending -> 群内警告 (不自动删)
- *  - 判定只看 ID 阈值 + tag 非空, 不看发言权限:
+ *  - 状态全部在用户 tag (setChatMemberTag), 不用 KV / 不用内存:
+ *      tag 为空            = 新用户
+ *      tag 为纯数字        = 待验证 + 暂存消息ID (仓库频道的消息; 只保留最后一条)
+ *      tag 非空且非纯数字  = 已验证 (bot 写 FQer)
+ *  - 未验证用户 (ID>=8B 且 tag 无效) 在群里发消息:
+ *      禁言 -> 转发到仓库频道 -> 删原消息 -> 群内警告; 转发消息ID 写进用户 tag
+ *  - 判定只看 ID 阈值 + tag, 不看发言权限:
  *    被 join-group 验证放行 (restricted+can_send=true)、或管理员解除限制 (status=member) 的用户,
- *    只要 tag 为空, 发言即再次禁言 (与 tg-join-group-exam 不同: 那边"能发言=已验证", 这边"能发言≠已验证")
- *  - 私聊 /start: 仅待验证用户出题; 已验证 -> "已通过验证"; 其余 -> 简介
+ *    只要 tag 不是有效标记, 发言即再次禁言 (与 tg-join-group-exam 不同: 那边"能发言=已验证", 这边"能发言≠已验证")
+ *  - 私聊 /start: 待验证(tag 纯数字)用户出题; 已验证 -> "已通过验证"; 其余 -> 简介
  *  - 私聊答题: 归一化子串匹配 (对齐 VPS correct in user_answer);
- *      通过 -> 解除禁言 + 打 tag(FQer) + 恢复暂存消息 + 群内通知
+ *      通过 -> 解除禁言 + 恢复暂存消息(最后一条) + 打 tag(FQer) + 群内通知
  *  - 管理员命令 /add_valid_user <user_id> (群内): 手动放行待验证用户
  *  - 无任何自动删消息逻辑 (定时删除通知消息功能已砍)
  *
@@ -32,13 +29,12 @@
  *  - CHAT_ID       : vars, 目标群 ID (-100xxxxxxxxxx)
  *  - STORAGE_CHANNEL_ID: vars, 仓库频道 ID
  *  - RSS_URL       : vars, 博客的RSS
- *  KV bindings: PENDING (可缺省 = 无状态模式; VALID 已废弃: 白名单改为用户 tag)
+ *  KV bindings: 无 (状态全部在用户 tag)
  */
 
 const TG_API = "https://api.telegram.org/bot";
 const LEGACY_USER_ID_MAX = 8000000000; // ID < 8B = 早期用户, 免验证 (VPS 版阈值, 不是 2B)
-const PENDING_TTL_SECONDS = 86400; // 24h
-const VALID_TAG = "FQer"; // 已验证标记 (setChatMemberTag); tag 非空即有效
+const VALID_TAG = "FQer"; // 已验证标记 (setChatMemberTag); tag 非空且非纯数字即有效
 
 const Q_TYPES = ["rss", "youtube", "blog"];
 
@@ -174,11 +170,11 @@ async function fetchMember(env, userId) {
   }
 }
 
-// 已验证判定: ID >= 8B 的用户, tag 非空即有效 (tag 由本 bot 打/清, 值恒为 FQer)
+// 已验证判定: ID >= 8B 时, tag 非空且非纯数字即有效 (纯数字 = 暂存消息ID = 待验证)
 async function isValidUser(env, id) {
   if (isLegacy(id)) return true;
   const m = await fetchMember(env, id);
-  return !!m && !!m.tag;
+  return !!m && !!m.tag && !isPureNumeric(m.tag);
 }
 
 // ---------------------------------------------------------------- 题库
@@ -235,37 +231,21 @@ async function computeAnswer(env, type) {
   return await fetchLatestPostTitle(env);
 }
 
-// ---------------------------------------------------------------- 验证成功流程 (共用)
+// ---------------------------------------------------------------- tag 状态机 (无 KV)
 
-// PENDING KV 是否已绑定; 未绑定 => 无状态模式 (不暂存/恢复, "待验证" = 禁言状态)
-function hasPendingKV(env) {
-  return env.PENDING != null && typeof env.PENDING.get === "function";
+// tag 为纯数字 = 暂存消息ID (待验证标记)
+function isPureNumeric(s) {
+  return /^\d+$/.test(s);
 }
 
-// 无状态"待验证"判定: restricted 且不能发文字 = 被禁言中
-async function isRestrictedMuted(env, userId) {
+// 待验证判定 + 暂存消息ID: tag 为纯数字时返回该 ID (仓库频道消息), 否则 null
+async function pendingMessageId(env, userId) {
   const m = await fetchMember(env, userId);
-  return !!m && m.status === "restricted" && m.can_send_messages === false;
+  if (!m || !m.tag || !isPureNumeric(m.tag)) return null;
+  return Number(m.tag);
 }
 
-// 是否处于待验证: KV 模式看 pending 记录; 无状态模式看禁言状态
-async function inVerification(env, userId) {
-  if (hasPendingKV(env)) return (await readPending(env, userId)) !== null;
-  return await isRestrictedMuted(env, userId);
-}
-
-async function readPending(env, userId) {
-  if (!hasPendingKV(env)) return null; // 无状态模式: 无记录可读
-  const raw = await env.PENDING.get(String(userId));
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-// 验证通过: 解除禁言 + 打已验证 tag + 恢复仓库暂存消息 + 删 pending
+// 验证通过: 解除禁言 -> 恢复仓库暂存消息(最后一条) -> 打已验证 tag
 async function verifySuccess(env, userId) {
   await api(env, "restrictChatMember", {
     chat_id: env.CHAT_ID,
@@ -274,7 +254,27 @@ async function verifySuccess(env, userId) {
     use_independent_chat_permissions: true,
   });
 
-  // 已验证标记: 打 tag (tag 非空 = 有效)。失败仅告警 — 用户下次发言会被重新验证 (自愈)
+  // 恢复暂存消息: tag 上的纯数字 = 仓库频道消息 ID (只保留最后一条)
+  let restored = 0;
+  const storeId = await pendingMessageId(env, userId);
+  if (storeId && storageConfigured(env)) {
+    try {
+      await api(env, "forwardMessage", {
+        chat_id: env.CHAT_ID,
+        from_chat_id: env.STORAGE_CHANNEL_ID,
+        message_id: storeId,
+      });
+      await api(env, "deleteMessage", {
+        chat_id: env.STORAGE_CHANNEL_ID,
+        message_id: storeId,
+      });
+      restored = 1;
+    } catch (e) {
+      log(`restore msg ${storeId} failed: ${e.message}`);
+    }
+  }
+
+  // 已验证标记: 打 tag (非空且非纯数字 = 有效)。失败仅告警 — 用户下次发言会被重新验证 (自愈)
   try {
     await api(env, "setChatMemberTag", {
       chat_id: env.CHAT_ID,
@@ -284,35 +284,7 @@ async function verifySuccess(env, userId) {
   } catch (e) {
     log(`set tag failed user=${userId}: ${e.message}`);
   }
-
-  let restored = 0;
-  let joinTime = null;
-  if (hasPendingKV(env)) {
-    const pending = await readPending(env, userId);
-    if (pending) {
-      if (pending.join_time) joinTime = new Date(pending.join_time);
-      if (storageConfigured(env) && Array.isArray(pending.stored_messages)) {
-        for (const m of pending.stored_messages) {
-          try {
-            await api(env, "forwardMessage", {
-              chat_id: m.original_chat_id,
-              from_chat_id: env.STORAGE_CHANNEL_ID,
-              message_id: m.message_id,
-            });
-            await api(env, "deleteMessage", {
-              chat_id: env.STORAGE_CHANNEL_ID,
-              message_id: m.message_id,
-            });
-            restored += 1;
-          } catch (e) {
-            log(`restore msg ${m.message_id} failed: ${e.message}`);
-          }
-        }
-      }
-    }
-    await env.PENDING.delete(String(userId));
-  }
-  return { restored, joinTime };
+  return { restored };
 }
 
 // ---------------------------------------------------------------- 群消息: 未验证用户触发
@@ -365,18 +337,16 @@ async function handleGroupMessage(env, update) {
     log(`delete original failed: ${e.message}`);
   }
 
-  // 4. 记 pending (仅 KV 模式; 合并已有记录, 刷新 TTL)
-  if (hasPendingKV(env)) {
-    const pending = (await readPending(env, user.id)) || {
-      join_time: new Date().toISOString(),
-      stored_messages: [],
-    };
-    if (storedId) {
-      pending.stored_messages.push({ message_id: storedId, original_chat_id: chat.id });
-    }
-    await env.PENDING.put(String(user.id), JSON.stringify(pending), {
-      expirationTtl: PENDING_TTL_SECONDS,
+  // 4. 暂存消息ID 写进用户 tag (纯数字 = 待验证标记; 只保留最后一条)
+  //    无仓库/转发失败时写 "0" 作为占位待验证标记 (无消息可恢复)
+  try {
+    await api(env, "setChatMemberTag", {
+      chat_id: chat.id,
+      user_id: user.id,
+      tag: String(storedId ?? 0),
     });
+  } catch (e) {
+    log(`set store tag failed user=${user.id}: ${e.message}`);
   }
 
   // 5. 群内警告 (不自动删)
@@ -412,8 +382,8 @@ async function handleStart(env, user) {
     await api(env, "sendMessage", { chat_id: user.id, text: INTRO_TEXT });
     return;
   }
-  // 待验证才出题: KV 模式看记录; 无状态模式看是否被禁言
-  if (await inVerification(env, user.id)) {
+  // 待验证(tag 纯数字)才出题
+  if ((await pendingMessageId(env, user.id)) !== null) {
     const type = questionType(user.id);
     const title = await chatTitle(env);
     await api(env, "sendMessage", {
@@ -439,7 +409,7 @@ async function handleStart(env, user) {
 // 私聊答题
 async function handleAnswer(env, user, text) {
   if (!isTargetChat(env, env.CHAT_ID)) return; // 未配置: 不判分不放行
-  if (!(await inVerification(env, user.id))) return; // 不在待验证状态: 忽略 (KV 模式=无记录, 无状态模式=未被禁言)
+  if ((await pendingMessageId(env, user.id)) === null) return; // tag 非纯数字 = 不在待验证: 忽略
   if (isLegacy(user.id)) return;
   if (await isValidUser(env, user.id)) return; // 已放行, 防重复处理
 
@@ -465,20 +435,12 @@ async function handleAnswer(env, user, text) {
     return;
   }
 
-  // 通过: 解除禁言 + 白名单 + 恢复消息
-  const { restored, joinTime } = await verifySuccess(env, user.id);
-
-  const secs =
-    joinTime && !Number.isNaN(joinTime.getTime())
-      ? Math.max(0, Math.round((Date.now() - joinTime.getTime()) / 1000))
-      : null;
+  // 通过: 解除禁言 + 恢复暂存消息 + 打已验证 tag
+  const { restored } = await verifySuccess(env, user.id);
 
   await api(env, "sendMessage", {
     chat_id: user.id,
-    text:
-      `✅ 验证成功！\n\n` +
-      (secs != null ? `用时：${secs}秒\n` : "") +
-      `你现在可以在群组中发言了。`,
+    text: `✅ 验证成功！\n\n你现在可以在群组中发言了。`,
   });
 
   const username = await botUsername(env);
@@ -519,7 +481,7 @@ async function handleAdminVerify(env, update, arg) {
   }
 
   const targetId = Number(arg);
-  if (!(await inVerification(env, targetId))) {
+  if ((await pendingMessageId(env, targetId)) === null) {
     await api(env, "sendMessage", {
       chat_id: chat.id,
       reply_to_message_id: update.message.message_id,
